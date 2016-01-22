@@ -28,15 +28,78 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 
+import com.clearspring.analytics.TestUtils;
 import com.clearspring.analytics.util.Varint;
 
-import org.junit.Test;
+import org.apache.commons.lang3.RandomStringUtils;
 
+import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 
 public class TestHyperLogLogPlus {
+    private static final Logger log = LoggerFactory.getLogger(TestHyperLogLogPlus.class);
+
+    @Test
+    public void testEquals() {
+        HyperLogLogPlus hll1 = new HyperLogLogPlus(5, 25);
+        HyperLogLogPlus hll2 = new HyperLogLogPlus(5, 25);
+        hll1.offer("A");
+        hll2.offer("A");
+        assertEquals(hll1, hll2);
+        hll2.offer("B");
+        hll2.offer("C");
+        hll2.offer("D");
+        assertNotEquals(hll1, hll2);
+        HyperLogLogPlus hll3 = new HyperLogLogPlus(5, 25);
+        for (int i = 0; i < 50000; i++) {
+            hll3.offer("" + i);
+        }
+        assertNotEquals(hll1, hll3);
+    }
+    
+    @Test
+    public void consistentBytes() throws Throwable {
+        int[] NUM_STRINGS = {30, 50, 100, 200, 300, 500, 1000, 10000, 100000};
+        for (int n : NUM_STRINGS) {
+
+            String[] strings = new String[n];
+
+            for (int i = 0; i < n; i++) {
+                strings[i] = RandomStringUtils.randomAlphabetic(20);
+            }
+
+            HyperLogLogPlus hllpp1 = new HyperLogLogPlus(5, 5);
+            HyperLogLogPlus hllpp2 = new HyperLogLogPlus(5, 5);
+            for (int i = 0; i < n; i++) {
+                hllpp1.offer(strings[i]);
+                hllpp2.offer(strings[n - 1 - i]);
+            }
+            // calling these here ensures their internal state (format type) is stable for the rest of these checks.
+            // (end users have no need for this because they cannot access the format directly anyway)
+            hllpp1.mergeTempList();
+            hllpp2.mergeTempList();
+            log.debug("n={} format1={} format2={}", n, hllpp1.format, hllpp2.format);
+            try {
+                if (hllpp1.format == hllpp2.format) {
+                    assertEquals(hllpp1, hllpp2);
+                    assertEquals(hllpp1.hashCode(), hllpp2.hashCode());
+                    assertArrayEquals(hllpp1.getBytes(), hllpp2.getBytes());
+                } else {
+                    assertNotEquals(hllpp1, hllpp2);
+                }
+            } catch (Throwable any) {
+                log.error("n={} format1={} format2={}", n, hllpp1.format, hllpp2.format, any);
+                throw any;
+            }
+        }
+    }
 
     public static void main(final String[] args) throws Throwable {
         long startTime = System.currentTimeMillis();
@@ -112,21 +175,6 @@ public class TestHyperLogLogPlus {
         assertTrue(estimate <= expectedCardinality + (3 * se));
     }
 
-//    @Test
-//    public void testDelta()
-//    {
-//        HyperLogLogPlus hll = new HyperLogLogPlus(14, 25);
-//        ArrayList<byte[]> l = new ArrayList<byte[]>();
-//        for (int i = 0; i < 1000000; i++)
-//        {
-//            hll.deltaAdd(l,i);
-//            int out = hll.deltaRead(l,i);
-//            assert i == out;
-//            int out2 = hll.deltaRead(l,i);
-//            assert i == out2;
-//        }
-//    }
-
     @Test
     public void testSerialization_Normal() throws IOException {
         HyperLogLogPlus hll = new HyperLogLogPlus(5, 25);
@@ -135,6 +183,17 @@ public class TestHyperLogLogPlus {
         }
         System.out.println(hll.cardinality());
         HyperLogLogPlus hll2 = HyperLogLogPlus.Builder.build(hll.getBytes());
+        assertEquals(hll.cardinality(), hll2.cardinality());
+    }
+
+    @Test
+    public void testSerialization() throws IOException, ClassNotFoundException {
+        HyperLogLogPlus hll = new HyperLogLogPlus(5, 25);
+        for (int i = 0; i < 100000; i++) {
+            hll.offer("" + i);
+        }
+        System.out.println(hll.cardinality());
+        HyperLogLogPlus hll2 = (HyperLogLogPlus) TestUtils.deserialize(TestUtils.serialize(hll));
         assertEquals(hll.cardinality(), hll2.cardinality());
     }
 
@@ -212,12 +271,12 @@ public class TestHyperLogLogPlus {
                     if (sp < ps[j]) {
                         continue;
                     }
-                    System.out.println(ps[j] + "-" + sp + ": " + cardinality);
                     HyperLogLogPlus hllPlus = new HyperLogLogPlus(ps[j], sp);
                     for (int l = 0; l < cardinality; l++) {
                         hllPlus.offer(Math.random());
                     }
                     HyperLogLogPlus deserialized = HyperLogLogPlus.Builder.build(hllPlus.getBytes());
+                    System.out.println(ps[j] + "-" + sp + ": " + cardinality + " -> " + hllPlus.cardinality());
                     assertEquals(hllPlus.cardinality(), deserialized.cardinality());
                     ICardinality merged = hllPlus.merge(deserialized);
                     assertEquals(hllPlus.cardinality(), merged.cardinality());
@@ -436,5 +495,17 @@ public class TestHyperLogLogPlus {
 
         a.addAll(b);
         assertEquals(14, a.cardinality());
+    }
+    
+    @Test
+    public void testSerializationWithNewSortMethod() throws IOException {
+        HyperLogLogPlus hll = new HyperLogLogPlus(14, 25);
+        hll.offerHashed(0x0000000000000000l);
+        hll.offerHashed(0x7FFFFFFFFFFFFFFFl);
+        hll.offerHashed(0x8000000000000000l);
+        hll.offerHashed(0xFFFFFFFFFFFFFFFFl);
+
+        // test against old serialization
+        assertArrayEquals(new byte[]{-1, -1, -1, -2, 14, 25, 1, 4, 25, -27, -1, -1, 15, -101, -128, -128, -16, 7, -27, -1, -1, -97, 8}, hll.getBytes());
     }
 }

@@ -18,9 +18,15 @@ package com.clearspring.analytics.stream.cardinality;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInput;
 import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.DataOutputStream;
+import java.io.Externalizable;
 import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutput;
 import java.io.Serializable;
 
 import com.clearspring.analytics.hash.MurmurHash;
@@ -71,7 +77,7 @@ import com.clearspring.analytics.util.IBuilder;
  * implementation google provides.
  * </p>
  */
-public class HyperLogLog implements ICardinality {
+public class HyperLogLog implements ICardinality, Serializable {
 
     private final RegisterSet registerSet;
     private final int log2m;
@@ -92,6 +98,17 @@ public class HyperLogLog implements ICardinality {
         return (int) (Math.log((1.106 / rsd) * (1.106 / rsd)) / Math.log(2));
     }
 
+    private static double rsd(int log2m) {
+        return 1.106 / Math.sqrt(Math.exp(log2m * Math.log(2)));
+    }
+
+    private static void validateLog2m(int log2m) {
+        if (log2m < 0 || log2m > 30) {
+            throw new IllegalArgumentException("log2m argument is "
+                                               + log2m + " and is outside the range [0, 30]");
+        }
+    }
+
     /**
      * Create a new HyperLogLog instance.  The log2m parameter defines the accuracy of
      * the counter.  The larger the log2m the better the accuracy.
@@ -110,18 +127,15 @@ public class HyperLogLog implements ICardinality {
      *
      * @param registerSet - the initial values for the register set
      */
+    @Deprecated
     public HyperLogLog(int log2m, RegisterSet registerSet) {
-        if (log2m < 0 || log2m > 30) {
-            throw new IllegalArgumentException("log2m argument is "
-                                               + log2m + " and is outside the range [0, 30]");
-        }
+        validateLog2m(log2m);
         this.registerSet = registerSet;
         this.log2m = log2m;
         int m = 1 << this.log2m;
 
         alphaMM = getAlphaMM(log2m, m);
     }
-
 
     @Override
     public boolean offerHashed(long hashedValue) {
@@ -179,15 +193,18 @@ public class HyperLogLog implements ICardinality {
     @Override
     public byte[] getBytes() throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        DataOutputStream dos = new DataOutputStream(baos);
-
-        dos.writeInt(log2m);
-        dos.writeInt(registerSet.size * 4);
-        for (int x : registerSet.readOnlyBits()) {
-            dos.writeInt(x);
-        }
+        DataOutput dos = new DataOutputStream(baos);
+        writeBytes(dos);
 
         return baos.toByteArray();
+    }
+
+    private void writeBytes(DataOutput serializedByteStream) throws IOException {
+        serializedByteStream.writeInt(log2m);
+        serializedByteStream.writeInt(registerSet.size * 4);
+        for (int x : registerSet.readOnlyBits()) {
+            serializedByteStream.writeInt(x);
+        }
     }
 
     /**
@@ -226,34 +243,117 @@ public class HyperLogLog implements ICardinality {
         return merged;
     }
 
+    private Object writeReplace() {
+        return new SerializationHolder(this);
+    }
+
+    /**
+     * This class exists to support Externalizable semantics for
+     * HyperLogLog objects without having to expose a public
+     * constructor, public write/read methods, or pretend final
+     * fields aren't final.
+     *
+     * In short, Externalizable allows you to skip some of the more
+     * verbose meta-data default Serializable gets you, but still
+     * includes the class name. In that sense, there is some cost
+     * to this holder object because it has a longer class name. I
+     * imagine people who care about optimizing for that have their
+     * own work-around for long class names in general, or just use
+     * a custom serialization framework. Therefore we make no attempt
+     * to optimize that here (eg. by raising this from an inner class
+     * and giving it an unhelpful name).
+     */
+    private static class SerializationHolder implements Externalizable {
+
+        HyperLogLog hyperLogLogHolder;
+
+        public SerializationHolder(HyperLogLog hyperLogLogHolder) {
+            this.hyperLogLogHolder = hyperLogLogHolder;
+        }
+
+        /**
+         * required for Externalizable
+         */
+        public SerializationHolder() {
+
+        }
+
+        @Override
+        public void writeExternal(ObjectOutput out) throws IOException {
+            hyperLogLogHolder.writeBytes(out);
+        }
+
+        @Override
+        public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException {
+            hyperLogLogHolder = Builder.build(in);
+        }
+
+        private Object readResolve() {
+            return hyperLogLogHolder;
+        }
+    }
+
     public static class Builder implements IBuilder<ICardinality>, Serializable {
+        private static final long serialVersionUID = -2567898469253021883L;
 
-        private double rsd;
+        private final double rsd;
+        private transient int log2m;
 
+        /**
+         * Uses the given RSD percentage to determine how many bytes the constructed HyperLogLog will use.
+         *
+         * @deprecated Use {@link #withRsd(double)} instead. This builder's constructors did not match the (already
+         * themselves ambiguous) constructors of the HyperLogLog class, but there is no way to make them match without
+         * risking behavior changes downstream.
+         */
+        @Deprecated
         public Builder(double rsd) {
+            this.log2m = log2m(rsd);
+            validateLog2m(log2m);
             this.rsd = rsd;
+        }
+
+        /** This constructor is private to prevent behavior change for ambiguous usages. (Legacy support). */
+        private Builder(int log2m) {
+            this.log2m = log2m;
+            validateLog2m(log2m);
+            this.rsd = rsd(log2m);
+        }
+
+        private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+            in.defaultReadObject();
+            this.log2m = log2m(rsd);
         }
 
         @Override
         public HyperLogLog build() {
-            return new HyperLogLog(rsd);
+            return new HyperLogLog(log2m);
         }
 
         @Override
         public int sizeof() {
-            int log2m = log2m(rsd);
             int k = 1 << log2m;
             return RegisterSet.getBits(k) * 4;
         }
 
+        public static Builder withLog2m(int log2m) {
+            return new Builder(log2m);
+        }
+
+        public static Builder withRsd(double rsd) {
+            return new Builder(rsd);
+        }
+
         public static HyperLogLog build(byte[] bytes) throws IOException {
             ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
-            DataInputStream oi = new DataInputStream(bais);
-            int log2m = oi.readInt();
-            int size = oi.readInt();
-            byte[] longArrayBytes = new byte[size];
-            oi.readFully(longArrayBytes);
-            return new HyperLogLog(log2m, new RegisterSet(1 << log2m, Bits.getBits(longArrayBytes)));
+            return build(new DataInputStream(bais));
+        }
+
+        public static HyperLogLog build(DataInput serializedByteStream) throws IOException {
+            int log2m = serializedByteStream.readInt();
+            int byteArraySize = serializedByteStream.readInt();
+            return new HyperLogLog(log2m,
+                    new RegisterSet(1 << log2m, Bits.getBits(serializedByteStream, byteArraySize)));
         }
     }
 
